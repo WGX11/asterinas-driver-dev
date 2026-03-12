@@ -117,6 +117,24 @@ roles: [student]
 
 ---
 
+## 七（补充）、VirtIO Input 事件处理
+
+### 事件类型
+- **EV_KEY**: 键盘/按键事件（状态：0=释放，1=按下，2=重复）
+- **EV_REL**: 相对运动事件（鼠标移动）
+- **EV_ABS**: 绝对坐标事件（触摸屏）
+- **SYN_REPORT**: 同步事件（标记一组事件的结束）
+
+### 事件处理流程
+1. 从 EventBuf 读取 `VirtioInputEvent`
+2. 根据 event.type 分发到不同处理器
+3. **SYN_REPORT 必须提交到子系统**，而不是忽略或提交空数组
+4. 使用 `InputEvent::from_sync_event(SynEvent::Report)` 创建同步事件
+
+**易错点**：SYN_REPORT 不是边界标记，而是必须提交的实际事件，用于通知输入子系统"一组事件已完成"。
+
+---
+
 ## 八、常见反模式（禁止！）
 
 ### 🔴 反模式1：过度创新架构
