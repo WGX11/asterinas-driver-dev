@@ -10,10 +10,23 @@ roles: [student]
 
 1. **严格遵循标准答案结构**：不要"过度创新"或发明新的架构
 2. **只修改 MASK 标记区域**：绝不删除或修改 quiz 范围外的代码
+   - **关键**：即使某个模块（如 config.rs）看起来"没用"，也不要删除它
+   - **关键**：mod.rs 中的 `mod config;` 声明不能删除，否则会导致依赖链断裂
 3. **先参考已有实现**：在动手前，必须先阅读并理解同类驱动的标准写法
 4. **PAGE_SIZE 是硬限制**：所有 DMA buffer 分配不能超过 4096 字节
 
 **✅ 实战验证**：这套指南已通过 VirtIO Console 和 Input 两个完整驱动的验证（L3 整驱动级别，100% 通过率）。
+
+**违反核心原则2的典型后果**：
+```
+error[E0583]: file not found for module `config`
+  --> kernel/comps/virtio/src/device/console/mod.rs:XX:Y
+   |
+XX | mod config;
+   | ^^^^^^^^^^
+   = help: to create the module `config`, create file ".../config.rs"
+```
+**原因**：删除了 config.rs 文件或 `mod config;` 声明，导致整个驱动架构断裂。
 
 ---
 
@@ -204,9 +217,25 @@ while reader.remain() > 0 {  // ✅ 循环处理所有数据
 **正确做法**：复用 init 时预分配的 buffer（存储在设备结构体中）
 
 ### 🔴 反模式3：错误的 API 使用
-**错误做法**：猜测 API 名称（如 `read_once()`）
+**错误做法**：
+- 猜测 API 名称（如 `read_once()`）
+- 调用 `sync_from_device()` 不传参数
+- 调用 `add_dma_buf(stream, &[])` 传递错误类型
 
-**正确做法**：探索代码时注意方法签名，确认正确的方法名（如 `read()`）
+**正确做法**：
+```rust
+// ✅ 同步必须传 range 参数
+buffer.sync_from_device(0..len).unwrap();
+buffer.sync_to_device(0..len).unwrap();
+
+// ✅ add_dma_buf 必须传递 Slice 的数组切片
+let slice = Slice::new(&buffer, 0..len);
+queue.add_dma_buf(&[&slice], &[]).unwrap();  // inputs, outputs
+```
+
+**关键约束**：
+- `sync_*` 方法**必须**传递 `Range<usize>` 参数
+- `add_dma_buf` 第一个参数是 `&[&Slice]`，不是 `&Arc<DmaStream>`
 
 ### 🔴 反模式4：修改 quiz 范围外的代码
 **错误做法**：删除未标记 MASK 的函数或修改其他区域
@@ -254,6 +283,37 @@ while reader.remain() > 0 {  // ✅ 循环直到所有数据发完
 - `found struct but expected trait` → 命名冲突，使用完整路径或改名
 - `type annotations needed` → 添加明确的类型标注
 
+### 🔴 反模式7：删除或破坏配置空间模块
+**错误做法**：
+- 删除 `config.rs` 文件或大幅缩减其内容（如从 73 行减到 1 行）
+- 删除 `mod config;` 声明，导致模块依赖链断裂
+- 自定义 `Config` 结构体时不实现必需的 trait
+
+**正确做法**：
+1. **保留完整的 config.rs 模块**，不要删除任何未标记 MASK 的代码
+2. **保留 mod.rs 中的模块声明**：`mod config;`
+3. 如果需要定义配置结构体，**必须实现所有必需的 trait**：
+```rust
+#[derive(Debug, Pod, Clone, Copy)]  // ✅ Pod trait 是必需的！
+#[repr(C)]
+pub struct VirtioConsoleConfig {
+    pub cols: u16,
+    pub rows: u16,
+    pub max_nr_ports: u32,
+    pub emerg_wr: u32,
+}
+```
+
+**关键约束**：
+- VirtIO 配置结构体**必须**实现 `Pod` trait（来自 `ostd_pod`）
+- `Pod` trait 要求：`KnownLayout` + `Immutable` + `Copy` + `FromZeros` 等
+- 使用 `#[derive(Pod, Clone, Copy)]` 自动派生，不要手动实现
+
+**为什么重要**：
+- `ConfigManager<T>` 泛型约束要求 `T: Pod`
+- 配置空间管理是 VirtIO 驱动的核心部分，删除会导致编译失败
+- 模块依赖链断裂会引发连锁错误（22+ 编译错误）
+
 ### 其他反模式（续）
 1. 队列索引混淆：确认每个队列的索引号
 2. DMA 同步遗漏：必须在数据传输前后同步
@@ -263,6 +323,17 @@ while reader.remain() > 0 {  // ✅ 循环直到所有数据发完
 ---
 
 ## 九、编码步骤
+
+### Step 0: 检查 MASK 范围（关键！）
+**在动手前必须确认**：
+1. 哪些文件被标记为需要修改（查看 quiz meta.yaml）
+2. 每个文件中哪些行是 MASK 区域（`// MASK_START` / `// MASK_END`）
+3. **绝不要删除或修改 MASK 外的代码**，即使看起来"没用"
+
+**常见陷阱**：
+- 删除 `config.rs` 或缩减其内容 → 编译失败
+- 删除 `mod config;` → 模块依赖链断裂
+- 修改结构体定义（非 MASK 区域） → 类型不匹配
 
 ### Step 1: 先看同类驱动（5分钟）
 查看 `kernel/comps/virtio/src/device/` 下的标准实现
