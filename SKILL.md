@@ -296,6 +296,11 @@ Socket支持的连接操作：
 5. ❌ 读取guest_cid时用 `read_once::<u64>()`（必须分两次读32位）
 6. ❌ 忘记等待发送完成（`can_pop` + `pop_used`）
 7. ❌ 设备注册位置错误（应注册到 `VSOCK_DEVICE_TABLE`）
+8. ❌ **receive方法中set_packet_len参数错误**（关键！）
+   - 错误：`rx_buffer.set_packet_len(len as usize)`（len包含header）
+   - 正确：`rx_buffer.set_packet_len(len as usize - size_of::<VirtioVsockHdr>())`
+   - 原因：`pop_used()`返回的len包含header和payload，但buf()读取时只应包含payload
+   - 参考：network设备的实现也是这样做的
 
 ---
 
