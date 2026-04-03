@@ -198,35 +198,14 @@ let writer = buffer.writer().unwrap();     // ✅ 现在可以调用
 
 **⚠️ 关键：大数据（> buffer size）必须分块发送，循环等待每次完成**
 
-**标准模式**（Console send 为例）：
-```rust
-let mut reader = VmReader::from(data);
-while reader.remain() > 0 {  // ✅ 循环处理所有数据
-    // 1. 写入一块数据到 buffer
-    let mut writer = self.send_buffer.writer().unwrap();
-    let len = writer.write(&mut reader);
-    
-    // 2. 同步到设备
-    self.send_buffer.sync_to_device(0..len).unwrap();
-    
-    // 3. 创建 Slice 并添加到队列
-    let slice = Slice::new(&self.send_buffer, 0..len);
-    transmit_queue.add_dma_buf(&[&slice], &[]).unwrap();
-    
-    // 4. 通知设备
-    if transmit_queue.should_notify() {
-        transmit_queue.notify();
-    }
-    
-    // 5. 等待当前块传输完成（必须在循环内！）
-    while !transmit_queue.can_pop() {
-        spin_loop();
-    }
-    
-    // 6. 取回传输完成的缓冲区
-    transmit_queue.pop_used().unwrap();
-}
-```
+**标准模式**（循环处理所有数据）：
+1. 写入一块数据到 buffer（`writer.write(&mut reader)`）
+2. 同步到设备（`sync_to_device(0..len)`）
+3. 创建 Slice 并添加到队列（`add_dma_buf(&[&slice], &[])`）
+4. 通知设备（`should_notify()` + `notify()`）
+5. **等待当前块传输完成**（`while !can_pop() { spin_loop(); }`）
+6. 取回传输完成的缓冲区（`pop_used()`）
+7. **循环回到步骤1**，直到所有数据发完
 
 **易错点**：
 - ❌ 只发送前 N 字节就返回（如 `write_len.min(BUFFER_SIZE)`）
@@ -355,7 +334,107 @@ Socket支持的连接操作：
 
 ---
 
-## 八、常见反模式（禁止！）
+## 八、VirtIO Block 驱动（异步队列模式）
+
+### 核心架构模式
+**VirtIO Block 驱动使用异步队列模式**，与 Console/Input 的同步模式完全不同：
+
+**关键差异**：
+- ❌ 错误：使用 busy-wait 等待完成（`while !can_pop() { spin_loop() }`）
+- ✅ 正确：提交请求后立即返回，通过中断处理完成回调
+
+**标准架构**：
+1. **提交请求**（不等待）：构造请求 → 提交到 VirtQueue → notify 设备 → 立即返回
+2. **中断处理完成**：从 VirtQueue 弹出请求 → 处理响应 → 通知上层 BioRequest 完成
+
+### Block API 正确使用
+
+**核心类型**：
+- `BioRequest`：块 I/O 请求（包含多个 segment）
+- `BioSegment`：单个数据段（一个页面大小的数据块）
+- `BioType`：请求类型（Read/Write/Flush等）
+- `BioStatus`：完成状态（Success/IoError等）
+- `BlockId<512>`：块设备扇区 ID（类型安全的 u64 包装）
+
+**易错点1：访问 segment 数据**
+- ❌ 错误：调用不存在的方法（`seg.direction()`、`seg.read()`）
+- ✅ 正确：使用 VmReader/VmWriter（`seg.reader()`、`writer.write()`）
+
+**易错点2：获取扇区号**
+- ❌ 错误：类型不匹配（`BlockId<512> != u64`）
+- ✅ 正确：使用 `sid_range().start.to_raw()` 返回 BlockId，直接传递给 VirtIO header
+
+**易错点3：完成请求**
+- ❌ 错误：panic 处理错误（中断上下文中不应该 panic）
+- ✅ 正确：设置 `BioStatus::IoError` 优雅处理错误
+
+### Descriptor Chain 构造规则
+
+**读操作（ReqType::In）**：
+- inputs: `[request_header_slice]`（设备读取请求头）
+- outputs: `[data_slice, response_slice]`（设备写入数据和响应）
+
+**写操作（ReqType::Out）**：
+- inputs: `[request_header_slice, data_slice]`（设备读取请求头和数据）
+- outputs: `[response_slice]`（设备写入响应）
+
+**关键约束**：
+- **input** = 设备从内存读取（Driver → Device）
+- **output** = 设备向内存写入（Device → Driver）
+- 读操作的数据缓冲区是 **output**（设备写入数据）
+- 写操作的数据缓冲区是 **input**（设备读取数据）
+
+### 请求-响应匹配（关键！）
+
+**使用 ID 分配器追踪请求**：
+- 提交时：`id = id_allocator.alloc()` → `pending_requests.insert(id, bio_request)`
+- 完成时：`bio_request = pending_requests.remove(&id)` → 处理响应 → `id_allocator.dealloc(id)`
+
+**易错点**：忘记回收 ID → ID 耗尽 → 驱动卡死
+
+### DMA 缓冲区管理
+
+**预分配缓冲池**（在 init 时，不是每次请求时）：
+- 使用 `DmaStream::alloc` 分配大块缓冲区
+- 使用 `Slice::new` 分片管理多个请求槽位
+- 槽位计算：`id * SIZE..(id + 1) * SIZE`
+
+**DMA 同步规则**：
+- **提交前**：`sync_to_device()` 同步请求头和数据（写操作）
+- **完成后**：`sync_from_device()` 同步响应和数据（读操作）
+
+### 中断处理流程
+
+**标准步骤**：
+1. 禁用中断避免嵌套：`queue.disable_irq().lock()`
+2. 循环弹出完成的请求：`while can_pop() { pop_used() }`
+3. 根据 token 找到请求：从 `pending_requests` 移除
+4. 检查响应状态：读取 `VirtioBlockResp.status`
+5. DMA 同步数据（读操作）：`sync_from_device()`
+6. 完成请求：`bio_request.end_with(BioStatus::Success/IoError)`
+7. 回收资源：`id_allocator.dealloc(id)`
+
+**关键约束**：必须在中断上下文中禁用中断锁，避免嵌套中断
+
+### 最易错点总结
+
+1. ❌ 使用 busy-wait 而非中断驱动模式
+2. ❌ 调用 `seg.direction()`、`seg.read()` 等不存在的方法
+3. ❌ Descriptor chain 方向错误（input/output 混淆）
+4. ❌ 忘记 DMA 同步（`sync_to_device` / `sync_from_device`）
+5. ❌ 忘记回收请求 ID（`id_allocator.dealloc`）
+6. ❌ 在中断上下文中 panic（应使用 `BioStatus::IoError`）
+7. ❌ 每次请求都分配 DMA buffer（应复用缓冲池）
+
+### 参考实现
+**务必先阅读**：`kernel/comps/virtio/src/device/block/device.rs`
+- 理解 `BioRequestSingleQueue` 如何管理 pending requests
+- 理解如何使用 `id_allocator` 追踪请求生命周期
+- 理解中断处理中的资源回收流程
+
+---
+
+## 九、常见反模式（禁止！）
 
 ### 🔴 反模式1：过度创新架构
 **错误做法**：自己发明新的 buffer 管理机制（如 ReceiveBuffers + SafePtr）
@@ -390,18 +469,10 @@ Socket支持的连接操作：
 - 不使用 while 循环处理剩余数据
 
 **正确做法**：
-```rust
-let mut reader = VmReader::from(data);
-while reader.remain() > 0 {  // ✅ 循环直到所有数据发完
-    // 写入一块
-    let len = writer.write(&mut reader);
-    // 发送这块
-    // ...
-    // 等待完成
-    while !queue.can_pop() { spin_loop(); }
-    queue.pop_used().unwrap();
-}
-```
+1. 使用 while 循环：`while reader.remain() > 0`
+2. 每次发送一块数据
+3. **必须**等待当前块完成：`while !can_pop() { spin_loop(); }` + `pop_used()`
+4. 循环直到所有数据发完
 
 **实战教训**：VirtIO buffer 有大小限制，大数据必须分块发送并同步等待每块完成。
 
@@ -433,22 +504,12 @@ while reader.remain() > 0 {  // ✅ 循环直到所有数据发完
 **正确做法**：
 1. **保留完整的 config.rs 模块**，不要删除任何未标记 MASK 的代码
 2. **保留 mod.rs 中的模块声明**：`mod config;`
-3. 如果需要定义配置结构体，**必须实现所有必需的 trait**：
-```rust
-#[derive(Debug, Pod, Clone, Copy)]  // ✅ Pod trait 是必需的！
-#[repr(C)]
-pub struct VirtioConsoleConfig {
-    pub cols: u16,
-    pub rows: u16,
-    pub max_nr_ports: u32,
-    pub emerg_wr: u32,
-}
-```
+3. 如果需要定义配置结构体，**必须实现所有必需的 trait**：使用 `#[derive(Pod, Clone, Copy)]` 自动派生
 
 **关键约束**：
 - VirtIO 配置结构体**必须**实现 `Pod` trait（来自 `ostd_pod`）
 - `Pod` trait 要求：`KnownLayout` + `Immutable` + `Copy` + `FromZeros` 等
-- 使用 `#[derive(Pod, Clone, Copy)]` 自动派生，不要手动实现
+- 不要手动实现，使用 `#[derive(Pod, Clone, Copy)]` 自动派生
 
 **为什么重要**：
 - `ConfigManager<T>` 泛型约束要求 `T: Pod`
@@ -463,18 +524,12 @@ pub struct VirtioConsoleConfig {
 
 ---
 
-## 九、编码步骤
+## 九、编码步骤（精简版）
 
 ### Step 0: 检查 MASK 范围（关键！）
-**在动手前必须确认**：
-1. 哪些文件被标记为需要修改（查看 quiz meta.yaml）
-2. 每个文件中哪些行是 MASK 区域（`// MASK_START` / `// MASK_END`）
-3. **绝不要删除或修改 MASK 外的代码**，即使看起来"没用"
-
-**常见陷阱**：
-- 删除 `config.rs` 或缩减其内容 → 编译失败
-- 删除 `mod config;` → 模块依赖链断裂
-- 修改结构体定义（非 MASK 区域） → 类型不匹配
+1. 确认哪些文件被标记为需要修改（查看 quiz meta.yaml）
+2. 确认每个文件中哪些行是 MASK 区域
+3. **绝不要删除或修改 MASK 外的代码**
 
 ### Step 1: 先看同类驱动（5分钟）
 查看 `kernel/comps/virtio/src/device/` 下的标准实现
@@ -489,11 +544,11 @@ pub struct VirtioConsoleConfig {
 
 ### Step 4: 确保编译通过
 - 检查类型签名是否匹配
-- 检查方法名称是否正确（探索时注意看方法定义）
+- 检查方法名称是否正确
+- **每次修改后立即 cargo check**
 
 ### Step 5: 验证功能
-- 运行测试脚本
-- 检查日志输出
+运行测试脚本，检查日志输出
 
 ---
 
@@ -525,62 +580,6 @@ pub struct VirtioConsoleConfig {
 2. **运行时 panic**：检查 buffer 大小是否超过 PAGE_SIZE
 3. **测试超时**：检查队列索引是否正确，notify 是否被调用
 4. **数据不一致**：检查 sync_to_device/sync_from_device 是否遗漏
-
----
-
-## 十二、实战验证的编码流程（✅ 已验证有效）
-
-以下流程已通过 VirtIO Console 和 Input 两个完整驱动的验证：
-
-### Step 1: 理解设备需求（5分钟）
-1. 确认设备类型和队列布局
-2. 确认缓冲区策略（单缓冲区 vs 缓冲池）
-3. 确认事件/数据流方向
-
-### Step 2: 阅读参考实现（10分钟）
-**关键**：阅读 `kernel/comps/virtio/src/device/` 下的标准实现
-- Console: 简单的双队列模式，适合学习基础
-- Input: 复杂的事件处理，适合学习批处理和缓冲池
-
-### Step 3: 实现核心结构（15分钟）
-1. 定义设备结构体（参考标准实现的字段）
-2. 实现 negotiate_features（使用 from_bits_truncate）
-3. **立即 cargo check 确保编译通过**
-
-### Step 4: 实现初始化流程（20分钟）
-**必须严格按顺序**：
-1. 创建 VirtQueue（确认队列索引正确）
-2. 分配 DMA 缓冲区（按页计算）
-3. 构建设备结构体
-4. 预填充接收队列（如果需要）
-5. 注册回调
-6. 调用 finish_init
-7. **每步后 cargo check**
-
-### Step 5: 实现数据流（20分钟）
-**发送数据**（Console 为例）：
-1. 用 writer() 写入数据
-2. sync_to_device 同步
-3. 创建 Slice（使用实际长度）
-4. add_dma_buf + should_notify + notify
-5. 等待 can_pop + pop_used
-
-**接收/处理数据**（Input 为例）：
-1. 在中断回调中处理
-2. sync_from_device 同步
-3. 读取数据
-4. 处理后重新提交缓冲区
-
-### Step 6: 验证和调试（10分钟）
-1. 运行测试脚本
-2. 检查 QEMU 输出日志
-3. 如果失败，逐步检查每个环节
-
-**成功关键**：
-- 严格遵守初始化顺序
-- 不要跳过同步步骤
-- 使用正确的 API（探索时注意方法签名）
-- 每步验证编译
 
 ---
 
