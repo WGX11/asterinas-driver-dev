@@ -17,16 +17,7 @@ roles: [student]
 
 **✅ 实战验证**：这套指南已通过 VirtIO Console、Input 和 Socket 三个完整驱动的验证（L3 整驱动级别）。
 
-**违反核心原则2的典型后果**：
-```
-error[E0583]: file not found for module `config`
-  --> kernel/comps/virtio/src/device/console/mod.rs:XX:Y
-   |
-XX | mod config;
-   | ^^^^^^^^^^
-   = help: to create the module `config`, create file ".../config.rs"
-```
-**原因**：删除了 config.rs 文件或 `mod config;` 声明，导致整个驱动架构断裂。
+**违反核心原则2的后果**：删除config.rs或`mod config;` → 编译错误"file not found for module" → 依赖链断裂
 
 ---
 
@@ -53,31 +44,8 @@ make build  # 或 cargo build
 3. **不要等 Judge 告诉你这些基础问题**
 
 ### 3. Trait 可见性规则
-**错误示例**：
-```rust
-let writer = buffer.writer().unwrap();  // ❌ 编译错误
-```
-**编译器提示**：
-```
-error[E0599]: no method named `writer` found for struct `DmaStream`
-  --> device.rs:50:25
-   |
-50 |         let writer = buffer.writer().unwrap();
-   |                         ^^^^^^ method not found in `DmaStream`
-   |
-   = help: items from traits can only be used if the trait is in scope
-   = note: the following trait is implemented but not in scope:
-           `HasVmReaderWriter`
-```
-
-**正确做法**：
-```rust
-use ostd::mm::io_util::HasVmReaderWriter;  // ✅ 添加 trait 导入
-
-let writer = buffer.writer().unwrap();     // ✅ 现在可以调用
-```
-
-**关键**：编译器已经告诉你缺什么了，**立即按提示修复**，不要跳过。
+**错误示例**：`buffer.writer().unwrap()` → 编译错误"method not found"（缺少trait导入）
+**正确做法**：`use ostd::mm::io_util::HasVmReaderWriter;` → 编译器已提示，立即修复
 
 ---
 
@@ -376,6 +344,31 @@ let writer = buffer.writer().unwrap();     // ✅ 现在可以调用
 7. 回收资源：`id_allocator.dealloc(id)`
 
 **关键约束**：必须在中断上下文中禁用中断锁，避免嵌套中断
+
+### ⭐ VirtIO Block 驱动实现要点
+
+**mod.rs 类型定义（绝不能删！）**：BlockFeatures, ReqType, RespStatus, VirtioBlockConfig（必须带Pod trait）, VirtioBlockReq, VirtioBlockResp
+
+**核心架构（参考标准实现！）**：
+1. DeviceInner（管理VirtQueue、缓冲池、pending_requests）
+2. BlockDevice（包装DeviceInner + 实现BlockDeviceOps）
+3. IdAllocator + pending_requests: BTreeMap<u16, SubmittedRequest>
+
+**关键流程**：
+- **init**: 创建VirtQueue → 分配DMA缓冲池 → 注册中断 → finish_init → 注册到Block子系统
+- **submit_bio**: 判断type_() → 构造请求头 → 迭代bios()+segments() → 分配ID → 提交到队列 → notify
+- **handle_irq**: 获取中断锁 → 循环pop_used() → 查找pending_request → 检查resp.status → 完成请求 → 回收ID
+
+### ⚠️ Block驱动常见失败（6大模式）
+
+1. **代码不完整**：306行 vs 560行标准答案 → 必须先读标准实现
+2. **括号不匹配**：未运行cargo check → IDE格式化+cargo check
+3. **删除mod.rs类型**：50+编译错误 → 绝对禁止删未标记MASK代码
+4. **BioRequest API误用**：`bio.type`不存在 → 正确：`bio_request.type_()`, 迭代`bios()`+`segments()`
+5. **同步/异步混淆**：busy-wait `while !can_pop()` → 异步：提交后返回，中断处理完成
+6. **缺少Pod trait**：85+编译错误 → 添加`#[padding_struct]` + `#[derive(Pod)]`
+
+**实现优先级**：1.编译通过（保留mod.rs所有定义）→ 2.核心架构（DeviceInner+IdAllocator）→ 3.关键路径（init+submit_bio+handle_irq）→ 4.验证测试
 
 ---
 
