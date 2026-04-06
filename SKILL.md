@@ -200,6 +200,26 @@ make build  # 或 cargo build
 
 **Input驱动**：批处理事件+SYN_REPORT必须提交，参考input/device.rs
 **Socket驱动**：SlotVec+缓冲池+流控制+guest_cid分两次读取，参考socket/device.rs完整流程
+**Console驱动**：2个队列（transmit=0/receive=1）+ 少量缓冲区 + Rcu多回调 + QEMU bug workaround（receive buffer限制1字节），参考console/device.rs
+
+### ⚠️ Console 驱动常见失败（3大模式）
+
+1. **队列索引颠倒**：transmit=0/receive=1（VirtIO Console 规范），颠倒导致功能失效
+2. **回调机制退化**：使用单个回调而非 `Rcu<Vec<&'static ConsoleCallback>>`（参考标准实现）
+3. **QEMU bug workaround 移除**：receive buffer 必须限制为 1 字节（QEMU bug）
+4. **Feature 命名错误**：应使用标准命名（如 VIRTIO_CONSOLE_F_SIZE 等），不要自定义
+5. **bits() 方法混淆**：`.bits` 是字段，`.bits()` 是方法，混淆导致编译失败
+
+### ⚠️ Socket 驱动常见失败（4大模式）
+
+1. **类型推断失败**：修改元组解构变量名（`(_, device)` → `(_callbacks, device)`）导致编译器无法推断类型
+   - **错误**：`.map(|(name, (_callbacks, device))| ...)` → 6+ 编译错误
+   - **正确**：保持原有变量名，或添加明确类型标注
+2. **流控字段缺失**：ConnectionInfo 缺少 `buf_alloc`、`fwd_cnt`、`last_fwd_cnt`、`tx_cnt` 等字段
+3. **核心 API 破坏**：删除 `receive` 方法或改变其签名，导致 API 不兼容
+4. **缓冲池参数错误**：`POOL_INIT_SIZE` 和 `POOL_HIGH_WATERMARK` 应参考标准实现
+
+**关键教训**：不要修改变量名"看起来更清楚"，Rust 类型推断依赖命名链！
 
 ---
 
@@ -434,35 +454,12 @@ make build  # 或 cargo build
 - `type annotations needed` → 添加明确的类型标注
 
 ### 🔴 反模式7：删除或破坏配置空间模块
-**错误做法**：
-- 删除 `config.rs` 文件或大幅缩减其内容（如从 73 行减到 1 行）
-- 删除 `mod config;` 声明，导致模块依赖链断裂
-- 自定义 `Config` 结构体时不实现必需的 trait
-
-**正确做法**：
-1. **保留完整的 config.rs 模块**，不要删除任何未标记 MASK 的代码
-2. **保留 mod.rs 中的模块声明**：`mod config;`
-3. 如果需要定义配置结构体，**必须实现所有必需的 trait**：使用 `#[derive(Pod, Clone, Copy)]` 自动派生
-
-**关键约束**：
-- VirtIO 配置结构体**必须**实现 `Pod` trait（来自 `ostd_pod`）
-- `Pod` trait 要求：`KnownLayout` + `Immutable` + `Copy` + `FromZeros` 等
-- 不要手动实现，使用 `#[derive(Pod, Clone, Copy)]` 自动派生
-
-**为什么重要**：
-- `ConfigManager<T>` 泛型约束要求 `T: Pod`
-- 配置空间管理是 VirtIO 驱动的核心部分，删除会导致编译失败
-- 模块依赖链断裂会引发连锁错误（22+ 编译错误）
-
-### 其他反模式（续）
-1. 队列索引混淆：确认每个队列的索引号
-2. DMA 同步遗漏：必须在数据传输前后同步
-3. 中断嵌套：在回调中直接获取锁而不禁用中断
-4. 缓冲区泄漏：从队列取出后忘记放回
+**错误**：删除 config.rs 或 `mod config;` → 22+ 编译错误
+**正确**：保留完整模块，使用 `#[derive(Pod, Clone, Copy)]`
 
 ---
 
-## 九、编码步骤（精简版）
+## 九、编码步骤
 
 ### Step 0: 检查 MASK 范围（关键！）
 1. 确认哪些文件被标记为需要修改（查看 quiz meta.yaml）
@@ -490,7 +487,7 @@ make build  # 或 cargo build
 
 ---
 
-## 十、API 快速参考
+## 十、API参考
 
 ### DMA Stream
 - `DmaStream::alloc(pages, direction)` - 分配 DMA 缓冲区（按页）
@@ -512,7 +509,7 @@ make build  # 或 cargo build
 
 ---
 
-## 十一、调试技巧
+## 十一、调试
 
 1. **编译错误**：检查方法名是否正确，类型是否匹配
 2. **运行时 panic**：检查 buffer 大小是否超过 PAGE_SIZE
@@ -521,7 +518,7 @@ make build  # 或 cargo build
 
 ---
 
-## 十二、DMA Zero-Copy 与 Descriptor Chain（核心！）
+## 十二、DMA Zero-Copy
 
 ### ⚠️ 核心原则
 
